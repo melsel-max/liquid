@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>土壤液化潛勢查詢</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { --bg:#f6f7f9; --panel:#fff; --text:#1f2933; --muted:#6b7280; --line:#e2e5ea; --accent:#2563eb; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "Microsoft JhengHei", system-ui, sans-serif; color:var(--text); background:var(--bg);
+         display:flex; height:100vh; }
+  aside { width:340px; max-width:100%; background:var(--panel); border-right:1px solid var(--line); padding:16px;
+          overflow-y:auto; flex-shrink:0; }
+  #map { flex:1; }
+  h1 { font-size:18px; margin:0 0 12px; }
+  h2 { font-size:14px; margin:18px 0 8px; color:var(--muted); font-weight:600; }
+  label { display:block; font-size:13px; margin:6px 0 2px; }
+  select, input, button { width:100%; padding:8px; font:inherit; font-size:14px; border:1px solid var(--line); border-radius:6px; background:#fff; }
+  button { background:var(--accent); color:#fff; border:0; cursor:pointer; margin-top:8px; }
+  button.secondary { background:#fff; color:var(--text); border:1px solid var(--line); }
+  .row { display:flex; gap:8px; }
+  .legend div { display:flex; align-items:center; gap:8px; font-size:13px; margin:3px 0; }
+  .sw { width:16px; height:16px; border-radius:3px; border:1px solid rgba(0,0,0,.2); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  td, th { padding:5px 4px; border-bottom:1px solid var(--line); text-align:left; }
+  th:last-child, td:last-child { text-align:right; }
+  .result { background:var(--bg); border-radius:8px; padding:10px; font-size:14px; line-height:1.6; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:10px; color:#fff; font-size:12px; }
+  .muted { color:var(--muted); font-size:12px; }
+  @media (max-width:700px) { body { flex-direction:column-reverse; } aside { width:100%; height:45vh; border-right:0; border-top:1px solid var(--line);} #map { height:55vh; } }
+</style>
+</head>
+<body>
+<aside>
+  <h1>土壤液化潛勢查詢</h1>
+
+  <h2>圖層篩選</h2>
+  <label for="selType">潛勢等級</label>
+  <select id="selType">
+    <option value="">全部</option>
+    <option value="HIGH">高潛勢 (HIGH)</option>
+    <option value="MED">中潛勢 (MED)</option>
+    <option value="LOW">低潛勢 (LOW)</option>
+    <option value="NOT">非潛勢區 (NOT)</option>
+  </select>
+  <label for="selYr">年度</label>
+  <select id="selYr">
+    <option value="">全部</option>
+    <option value="2026">2026</option>
+    <option value="2021">2021</option>
+  </select>
+  <button id="btnApply">套用篩選並統計</button>
+
+  <h2>門牌定位</h2>
+  <input id="inAddr" placeholder="例：台北市信義區市府路1號">
+  <button id="btnAddr" class="secondary">定位並查詢此門牌</button>
+  <div id="addrMsg" class="muted" style="margin-top:6px"></div>
+
+  <h2>座標查詢</h2>
+  <div class="row">
+    <input id="inLat" placeholder="緯度 例 25.0330" inputmode="decimal">
+    <input id="inLng" placeholder="經度 例 121.5654" inputmode="decimal">
+  </div>
+  <button id="btnCoord" class="secondary">查詢此座標</button>
+  <div class="muted" style="margin-top:6px">也可直接在地圖上點選任一位置查詢。</div>
+
+  <h2>查詢結果</h2>
+  <div id="result" class="result muted">尚未查詢</div>
+
+  <h2>篩選範圍面積統計</h2>
+  <div id="stats" class="muted">計算中…</div>
+
+  <h2>圖例</h2>
+  <div class="legend" id="legend"></div>
+  <p class="muted">資料來源：gis.liquid.net.tw Soil_cgs_2026 MapServer</p>
+</aside>
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const SERVICE = "https://gis.liquid.net.tw/arcgis/rest/services/P04032/Soil_cgs_2026/MapServer";
+const LAYER = SERVICE + "/0";
+const TYPES = {
+  HIGH: { name: "高潛勢", color: "#d7301f" },
+  MED:  { name: "中潛勢", color: "#ffd400" },
+  LOW:  { name: "低潛勢", color: "#7eff4d" },  // RGB(126,255,77)
+  NOT:  { name: "非潛勢區", color: null }       // 透明
+};
+
+// 圖層顏色以動態圖層覆寫服務的繪製樣式，使其與圖例一致
+function hexToRgba(h) {
+  return [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)).concat(255);
+}
+const RENDERER = {
+  type: "uniqueValue",
+  field1: "TYPE",
+  defaultSymbol: null,
+  uniqueValueInfos: Object.entries(TYPES).map(([k, t]) => ({
+    value: k,
+    label: t.name,
+    symbol: {
+      type: "esriSFS", style: t.color ? "esriSFSSolid" : "esriSFSNull",
+      color: t.color ? hexToRgba(t.color) : [0, 0, 0, 0],
+      outline: t.color
+        ? { type: "esriSLS", style: "esriSLSSolid", color: [110, 110, 110, 120], width: 0.4 }
+        : { type: "esriSLS", style: "esriSLSNull", color: [0, 0, 0, 0], width: 0 }
+    }
+  }))
+};
+
+document.getElementById("legend").innerHTML = Object.values(TYPES)
+  .map(t => `<div><span class="sw" style="background:${t.color ?? "transparent"}"></span>${t.name}</div>`).join("");
+
+const map = L.map("map").setView([23.7, 121], 8);
+// 國土測繪中心 通用版電子地圖 WMTS (Style=default, TileMatrixSet=GoogleMapsCompatible)
+L.tileLayer("https://wmts.nlsc.gov.tw/wmts/EMAP/default/GoogleMapsCompatible/{z}/{y}/{x}", {
+  maxZoom: 19, attribution: "&copy; <a href='https://maps.nlsc.gov.tw/' target='_blank'>內政部國土測繪中心</a>"
+}).addTo(map);
+
+// 以 ArcGIS export 動態出圖，並用 layerDefs 套用篩選
+const OverlayLayer = L.Layer.extend({
+  initialize(opts) { this.opts = opts; this.where = "1=1"; this.opacity = 0.7; },
+  onAdd(m) {
+    this.map = m;
+    this.img = L.imageOverlay("", m.getBounds(), { opacity: this.opacity, interactive: false }).addTo(m);
+    m.on("moveend", this.refresh, this);
+    this.refresh();
+  },
+  onRemove(m) { m.off("moveend", this.refresh, this); m.removeLayer(this.img); },
+  setWhere(w) { this.where = w; this.refresh(); },
+  refresh() {
+    const m = this.map, b = m.getBounds(), s = m.getSize();
+    const sw = L.CRS.EPSG3857.project(b.getSouthWest()), ne = L.CRS.EPSG3857.project(b.getNorthEast());
+    const p = new URLSearchParams({
+      bbox: [sw.x, sw.y, ne.x, ne.y].join(","),
+      bboxSR: 3857, imageSR: 3857, size: `${s.x},${s.y}`, format: "png32", transparent: true,
+      dynamicLayers: JSON.stringify([{
+        id: 0,
+        source: { type: "mapLayer", mapLayerId: 0 },
+        definitionExpression: this.where,
+        drawingInfo: { renderer: RENDERER }
+      }]),
+      f: "image"
+    });
+    const url = `${SERVICE}/export?${p}`;
+    this.img.setUrl(url);
+    this.img.setBounds(b);
+  }
+});
+const overlay = new OverlayLayer().addTo(map);
+
+function buildWhere() {
+  const t = document.getElementById("selType").value;
+  const y = document.getElementById("selYr").value;
+  const c = [];
+  if (t) c.push(`TYPE='${t}'`);
+  if (y) c.push(`Yr='${y}'`);
+  return c.length ? c.join(" AND ") : "1=1";
+}
+
+async function arcgisQuery(params) {
+  const body = new URLSearchParams({ f: "json", ...params });
+  const r = await fetch(LAYER + "/query", { method: "POST", body });
+  const j = await r.json();
+  if (j.error) throw new Error(j.error.message);
+  return j;
+}
+
+async function updateStats() {
+  const el = document.getElementById("stats");
+  el.textContent = "計算中…";
+  try {
+    const j = await arcgisQuery({
+      where: buildWhere(),
+      groupByFieldsForStatistics: "TYPE",
+      outStatistics: JSON.stringify([
+        { statisticType: "sum", onStatisticField: "Shape_Area", outStatisticFieldName: "area" },
+        { statisticType: "count", onStatisticField: "OBJECTID", outStatisticFieldName: "cnt" }
+      ])
+    });
+    const rows = j.features.map(f => f.attributes).sort((a, b) => b.area - a.area);
+    if (!rows.length) { el.textContent = "無符合資料"; return; }
+    el.innerHTML = `<table><tr><th>等級</th><th>筆數</th><th>面積 (km²)</th></tr>` +
+      rows.map(r => `<tr><td>${TYPES[r.TYPE]?.name ?? r.TYPE}</td><td>${r.cnt.toLocaleString()}</td>
+        <td>${(r.area / 1e6).toFixed(2)}</td></tr>`).join("") + `</table>
+      <div class="muted">面積為 Shape_Area 加總（依服務座標系 EPSG:3857，僅供參考）</div>`;
+  } catch (e) { el.textContent = "統計失敗：" + e.message; }
+}
+
+let marker;
+async function queryPoint(lat, lng) {
+  const el = document.getElementById("result");
+  if (marker) map.removeLayer(marker);
+  marker = L.marker([lat, lng]).addTo(map);
+  const pt = L.CRS.EPSG3857.project(L.latLng(lat, lng)); // 經緯度轉 EPSG:3857
+  el.className = "result"; el.textContent = "查詢中…";
+  try {
+    const j = await arcgisQuery({
+      where: buildWhere(),
+      geometry: JSON.stringify({ x: pt.x, y: pt.y, spatialReference: { wkid: 3857 } }),
+      geometryType: "esriGeometryPoint", inSR: 3857, spatialRel: "esriSpatialRelIntersects",
+      outFields: "OBJECTID,TYPE,Yr", returnGeometry: false
+    });
+    const svUrl = `https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=${lat},${lng}`;
+    const head = `座標：${lat.toFixed(5)}, ${lng.toFixed(5)}<br>
+      <a href="${svUrl}" target="_blank" rel="noopener">📷 開啟 Google 街景</a><br>`;
+    if (!j.features.length) { el.innerHTML = head + "此處不在符合篩選條件的圖資範圍內。"; return; }
+    el.innerHTML = head + j.features.map(f => {
+      const a = f.attributes, t = TYPES[a.TYPE] || { name: a.TYPE, color: "#555" };
+      return `<span class="badge" style="background:${t.color ?? "#9ca3af"}">${t.name}</span> 年度：${a.Yr ?? "—"} <span class="muted">(ID ${a.OBJECTID})</span>`;
+    }).join("<br>");
+  } catch (e) { el.textContent = "查詢失敗：" + e.message; }
+}
+
+map.on("click", e => queryPoint(e.latlng.lat, e.latlng.lng));
+
+document.getElementById("btnApply").onclick = () => { overlay.setWhere(buildWhere()); updateStats(); };
+async function geocodeAddress() {
+  const q = document.getElementById("inAddr").value.trim();
+  const msg = document.getElementById("addrMsg");
+  if (!q) { msg.textContent = "請輸入門牌地址"; return; }
+  msg.textContent = "定位中…";
+  try {
+    const p = new URLSearchParams({ SingleLine: q, f: "json", countryCode: "TWN", maxLocations: 1, outFields: "Addr_type" });
+    const r = await fetch("https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?" + p);
+    const j = await r.json();
+    const c = j.candidates && j.candidates[0];
+    if (!c || c.score < 70) { msg.textContent = "找不到此門牌，請輸入完整地址（縣市＋區＋路街＋門牌號）"; return; }
+    const exact = c.attributes.Addr_type === "PointAddress";
+    msg.textContent = c.address + (exact ? "" : "（僅定位到街道/區域，非精確門牌）");
+    map.setView([c.location.y, c.location.x], 18);
+    queryPoint(c.location.y, c.location.x);
+  } catch (e) { msg.textContent = "定位失敗：" + e.message; }
+}
+document.getElementById("btnAddr").onclick = geocodeAddress;
+document.getElementById("inAddr").addEventListener("keydown", e => { if (e.key === "Enter") geocodeAddress(); });
+
+document.getElementById("btnCoord").onclick = () => {
+  const lat = parseFloat(document.getElementById("inLat").value);
+  const lng = parseFloat(document.getElementById("inLng").value);
+  if (!isFinite(lat) || !isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) { alert("請輸入有效的經緯度"); return; }
+  map.setView([lat, lng], 16);
+  queryPoint(lat, lng);
+};
+
+updateStats();
+</script>
+</body>
+</html>
